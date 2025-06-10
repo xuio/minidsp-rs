@@ -128,6 +128,13 @@ async fn get_master_status(req: Request<Body>) -> Result<Response<Body>, Error> 
     let app = super::APP.get().unwrap();
     let app = app.read().await;
     let device = get_device_instance(&app, device_index)?;
+    let device_url = get_device(&app, device_index)?.url.clone();
+    let command_broadcaster = app
+        .device_manager
+        .as_ref()
+        .ok_or(Error::ApplicationStillInitializing)?
+        .command_broadcaster
+        .subscribe();
     let mut status = StatusSummary::fetch(&device).await?;
     let query_levels = req.query("levels").cloned();
     let query_poll = req.query("poll").cloned();
@@ -190,7 +197,7 @@ async fn get_master_status(req: Request<Body>) -> Result<Response<Body>, Error> 
             let polled_status = {
                 if query_poll.is_some() {
                     // Use a single shared device instance in order to avoid multiple level queries from being done simultaneously
-                    let polled_status_device = Arc::new(tokio::sync::Mutex::new(device));
+                    let polled_status_device = Arc::new(tokio::sync::Mutex::new(device.clone()));
                     status.input_levels.clear();
                     status.output_levels.clear();
                     let last_status = Arc::new(std::sync::Mutex::new(status));
@@ -226,7 +233,18 @@ async fn get_master_status(req: Request<Body>) -> Result<Response<Body>, Error> 
                 }
             };
 
-            futures::stream::select_all([status_stream, levels, polled_status].into_iter())
+            // Subscribe to state changes for immediate updates when commands are detected
+            let simulated_state_changes = {
+                let command_stream = super::command_broadcaster::subscribe_device_commands(command_broadcaster, device_url);
+                command_stream
+                    .map(|status_update| {
+                        let json = serde_json::to_string(&status_update).unwrap();
+                        Ok::<_, tungstenite::Error>(Message::Text(json))
+                    })
+                    .boxed()
+            };
+
+            futures::stream::select_all([status_stream, levels, polled_status, simulated_state_changes].into_iter())
                 .forward(websocket)
                 .await?;
 

@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 
 use crate::{config::Config, device_manager::DeviceManager, discovery::Registry};
 
+pub mod command_broadcaster;
 pub mod config;
 pub mod device_manager;
 pub mod discovery;

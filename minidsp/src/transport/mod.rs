@@ -32,6 +32,9 @@ pub use hub::Hub;
 #[cfg(feature = "mock")]
 pub mod mock;
 
+pub mod command_interceptor;
+pub use command_interceptor::{command_interceptor, CommandInterceptor};
+
 use self::multiplexer::MultiplexerService;
 pub mod net;
 pub mod ws;

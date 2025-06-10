@@ -493,6 +493,9 @@ impl Commands {
                 },
             },
             0x3b => Commands::FirLoadEnd,
+            0x3f => Commands::DiracBypass {
+                value: frame.try_get_u8()?,
+            },
             0x42 => Commands::SetVolume {
                 value: frame.try_get_u8()?.into(),
             },

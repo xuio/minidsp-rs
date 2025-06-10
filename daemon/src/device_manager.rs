@@ -10,21 +10,21 @@ use futures::{StreamExt, TryFutureExt};
 use minidsp::{
     client::Client,
     device::{self, probe},
-    logging,
-    transport::{self, SharedService},
+    transport::{self, SharedService, command_interceptor},
     utils::OwnedJoinHandle,
     DeviceInfo, MiniDSP,
 };
 use tokio::sync::Mutex;
 use url2::Url2;
 
-use super::discovery::{DiscoveryEvent, Registry};
+use super::{discovery::{DiscoveryEvent, Registry}, command_broadcaster::CommandEvent};
 
 pub struct DeviceManager {
     #[allow(dead_code)]
     inner: Arc<RwLock<DeviceManagerInner>>,
     #[allow(dead_code)]
     handles: Vec<OwnedJoinHandle<Result<(), anyhow::Error>>>,
+    pub command_broadcaster: tokio::sync::broadcast::Sender<CommandEvent>,
 }
 
 impl DeviceManager {
@@ -37,6 +37,8 @@ impl DeviceManager {
             registry,
             ..Default::default()
         };
+        
+        let command_broadcaster = tokio::sync::broadcast::channel(1000).0;
 
         let inner = Arc::new(std::sync::RwLock::new(inner));
         let mut handles = Vec::new();
@@ -73,8 +75,9 @@ impl DeviceManager {
 
             let task = {
                 let inner = inner.clone();
+                let command_broadcaster = command_broadcaster.clone();
                 tokio::spawn(async move {
-                    DeviceManager::task(inner).await;
+                    DeviceManager::task(inner, command_broadcaster).await;
                     Ok(())
                 })
                 .into()
@@ -82,7 +85,11 @@ impl DeviceManager {
             handles.push(task);
         }
 
-        DeviceManager { inner, handles }
+        DeviceManager { 
+            inner, 
+            handles, 
+            command_broadcaster,
+        }
     }
 
     pub fn register_static(&self, dev: &str) {
@@ -95,7 +102,7 @@ impl DeviceManager {
         inner.devices.clone()
     }
 
-    async fn task(inner: Arc<RwLock<DeviceManagerInner>>) {
+    async fn task(inner: Arc<RwLock<DeviceManagerInner>>, command_broadcaster: tokio::sync::broadcast::Sender<CommandEvent>) {
         let mut discovery_events = {
             let inner = inner.read().unwrap();
             inner.registry.subscribe()
@@ -109,7 +116,7 @@ impl DeviceManager {
                 let mut inner = inner.write().unwrap();
                 match event {
                     DiscoveryEvent::Added(id) => {
-                        inner.devices.push(Device::new(id, weak_inner).into());
+                        inner.devices.push(Device::new(id, weak_inner, command_broadcaster.clone()).into());
                     }
                     DiscoveryEvent::Timeout { id, last_seen } => {
                         log::info!(
@@ -149,11 +156,12 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn new(url: String, device_manager: Weak<RwLock<DeviceManagerInner>>) -> Self {
+    pub fn new(url: String, device_manager: Weak<RwLock<DeviceManagerInner>>, command_sender: tokio::sync::broadcast::Sender<CommandEvent>) -> Self {
         let inner = Arc::new(std::sync::RwLock::new(DeviceInner {
             url: url.clone(),
             device_manager,
-            ..Default::default()
+            command_sender: command_sender.clone(),
+            handle: None,
         }));
 
         let mut handles = Vec::new();
@@ -195,33 +203,86 @@ impl Device {
     }
 
     async fn task_inner(inner: Arc<RwLock<DeviceInner>>) -> anyhow::Result<()> {
-        let url = {
+        let (url, command_sender) = {
             let inner = inner.read().unwrap();
-            inner.url.clone()
+            (inner.url.clone(), inner.command_sender.clone())
         };
 
         log::info!("Connecting to {}", url.as_str());
 
         // Connect to the device by url, and get a frame-level transport
         let (mut transport, decoder) = {
-            let url = Url2::try_parse(url.as_str()).expect("Device::run had invalid url");
-            let stream = transport::open_url(&url).await?;
+            let url_parsed = Url2::try_parse(url.as_str()).expect("Device::run had invalid url");
+            let stream = transport::open_url(&url_parsed).await?;
 
-            // If we have any logging options, log this stream
+            // Wrap with command interceptor for broadcasting command events
+            let stream = command_interceptor(stream, url.clone(), command_sender);
+            
+            // If we have any logging options, also add logging
             let app = super::APP.get().unwrap();
             let app = app.read().await;
-            let (decoder, stream) =
-                logging::transport_logging(stream, app.opts.verbose, app.opts.log.clone());
+            let decoder = if app.opts.verbose > 0 {
+                use termcolor::{ColorChoice, StandardStream};
+                let writer = StandardStream::stderr(ColorChoice::Auto);
+                Some(Arc::new(tokio::sync::Mutex::new(minidsp::utils::decoder::Decoder::new(
+                    Box::new(writer),
+                    app.opts.verbose == 1,
+                    None,
+                ))))
+            } else {
+                None
+            };
+            
+            let stream: minidsp::transport::Transport = if app.opts.verbose > 0 || app.opts.log.is_some() {
+                let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
+                let logged_stream = minidsp::utils::logger(stream, log_tx);
+                
+                // Spawn logging task
+                if let Some(log_path) = app.opts.log.clone() {
+                    let decoder_clone = decoder.clone();
+                    tokio::spawn(async move {
+                        let mut recorder = Some(minidsp::utils::recorder::Recorder::new(
+                            tokio::fs::File::create(log_path).await.expect("Failed to create log file")
+                        ));
+                        
+                        futures::pin_mut!(log_rx);
+                        while let Some(msg) = futures::StreamExt::next(&mut log_rx).await {
+                            match msg {
+                                minidsp::utils::Message::Sent(msg) => {
+                                    if let Some(decoder) = &decoder_clone {
+                                        decoder.lock().await.feed_sent(&msg);
+                                    }
+                                    if let Some(recorder) = recorder.as_mut() {
+                                        recorder.feed_sent(&msg);
+                                    }
+                                }
+                                minidsp::utils::Message::Received(msg) => {
+                                    if let Some(decoder) = &decoder_clone {
+                                        decoder.lock().await.feed_recv(&msg);
+                                    }
+                                    if let Some(recorder) = recorder.as_mut() {
+                                        recorder.feed_recv(&msg);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                
+                Box::pin(logged_stream)
+            } else {
+                Box::pin(stream)
+            };
 
             (transport::Hub::new(stream), decoder)
         };
 
         // Wrap the transport into a multiplexed service for command-level multiplexing
         let service = {
-            let transport = transport
+            let transport_clone = transport
                 .try_clone()
                 .ok_or_else(|| anyhow!("transport closed prematurely"))?;
-            let mplex = transport::Multiplexer::from_transport(transport);
+            let mplex = transport::Multiplexer::from_transport(transport_clone);
             Arc::new(Mutex::new(mplex.to_service()))
         };
 
@@ -295,12 +356,13 @@ impl Device {
         }
     }
 }
-#[derive(Default)]
+
 pub struct DeviceInner {
     url: String,
     handle: Option<DeviceHandle>,
 
     device_manager: Weak<RwLock<DeviceManagerInner>>,
+    command_sender: tokio::sync::broadcast::Sender<CommandEvent>,
 }
 
 pub struct DeviceHandle {
